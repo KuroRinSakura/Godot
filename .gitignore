@@ -4,3 +4,10 @@ yarn-debug.log*
 yarn-error.log*
 .env
 certs/*.pem
+
+.idea/
+.godot/
+*.db
+*.db~
+database.json
+database.json.tmp
