@@ -1,133 +1,230 @@
-const path = require("path");
 const fs = require("fs");
-const http = require("http");
-const https = require("https");
+const path = require("path");
 const express = require("express");
 
 const app = express();
 const HOST = process.env.HOST || "0.0.0.0";
-const PROTOCOL = (process.env.PROTOCOL || process.env.SERVER_PROTOCOL || "http").toLowerCase();
-const PORT = Number(process.env.PORT || (PROTOCOL === "https" ? 3443 : 3000));
-const HTTP_PORT = Number(process.env.HTTP_PORT || 3000);
-const HTTPS_PORT = Number(process.env.HTTPS_PORT || 3443);
-const WEB_ROOT = path.resolve(__dirname, process.env.WEB_DIR || ".");
-const HTTPS_KEY = process.env.HTTPS_KEY || process.env.SSL_KEY;
-const HTTPS_CERT = process.env.HTTPS_CERT || process.env.SSL_CERT;
-const ALLOWED_PROTOCOLS = new Set(["http", "https", "both"]);
-
-const MIME_TYPES = {
-  ".wasm": "application/wasm",
-  ".pck": "application/octet-stream",
-  ".js": "application/javascript; charset=utf-8",
-  ".mjs": "application/javascript; charset=utf-8",
-  ".html": "text/html; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".svg": "image/svg+xml",
-  ".ico": "image/x-icon",
-};
+const PORT = Number(process.env.PORT) || 80;
+const DATABASE_PATH = process.env.DATABASE_PATH || path.join(__dirname, "database.json");
+const INTERNAL_PATHS = new Set([
+  "/database.json",
+  "/server.js",
+  "/package.json",
+  "/package-lock.json",
+]);
 
 app.disable("x-powered-by");
+app.use(express.json({ limit: "1mb" }));
 
-if (!ALLOWED_PROTOCOLS.has(PROTOCOL)) {
-  throw new Error("PROTOCOL must be http, https, or both.");
-}
-
-app.use((req, res, next) => {
-  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
-  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+app.use((_req, res, next) => {
+  res.set({
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Embedder-Policy": "require-corp",
+    "Cross-Origin-Resource-Policy": "same-origin",
+  });
   next();
+});
+
+app.get("/api/game-state", (_req, res) => {
+  res.json(readDatabase());
+});
+
+app.put("/api/game-state", saveGameState);
+app.post("/api/game-state", saveGameState);
+
+app.post("/api/reset-database", (_req, res) => {
+  const database = createDefaultDatabase();
+  writeDatabase(database);
+  console.log("[database] reset");
+  res.json({ ok: true, database });
 });
 
 app.use((req, res, next) => {
   let requestPath;
 
   try {
-    requestPath = decodeURIComponent(req.path).replace(/\\/g, "/");
+    requestPath = decodeURIComponent(req.path);
   } catch {
-    res.status(400).type("text/plain; charset=utf-8").send("Bad Request");
+    res.status(400).type("text/plain").send("Bad Request");
     return;
   }
 
-  const blocked = [
-    "/server.js",
-    "/package.json",
-    "/package-lock.json",
-    "/node_modules/",
-    "/certs/",
-    "/.env",
-  ];
-
-  if (blocked.some((entry) => requestPath === entry || requestPath.startsWith(entry))) {
-    res.status(404).type("text/plain; charset=utf-8").send("Not Found");
+  if (isInternalPath(requestPath)) {
+    res.status(404).type("text/plain").send("Not Found");
     return;
   }
 
   next();
 });
 
-app.use(express.static(WEB_ROOT, {
-  index: "index.html",
+app.use(express.static(__dirname, {
   dotfiles: "ignore",
+  index: "index.html",
   setHeaders: (res, filePath) => {
-    const ext = path.extname(filePath).toLowerCase();
-    const contentType = MIME_TYPES[ext];
+    const lowerPath = filePath.toLowerCase();
 
-    if (contentType) {
-      res.setHeader("Content-Type", contentType);
-    }
+    res.setHeader(
+      "Cache-Control",
+      lowerPath.endsWith(".html") ? "no-store" : "public, max-age=3600",
+    );
 
-    if (ext === ".html") {
-      res.setHeader("Cache-Control", "no-store");
-    } else {
-      res.setHeader("Cache-Control", "public, max-age=3600");
+    if (lowerPath.endsWith(".wasm")) {
+      res.setHeader("Content-Type", "application/wasm");
+    } else if (lowerPath.endsWith(".pck")) {
+      res.setHeader("Content-Type", "application/octet-stream");
     }
   },
 }));
 
-app.use((req, res) => {
-  res.status(404).type("text/plain; charset=utf-8").send("Not Found");
+app.use((_req, res) => {
+  res.status(404).type("text/plain").send("Not Found");
 });
 
-function resolveLocalPath(filePath) {
-  return path.isAbsolute(filePath) ? filePath : path.resolve(__dirname, filePath);
-}
-
-function getLocalUrl(protocol, port) {
+app.listen(PORT, HOST, () => {
   const displayHost = HOST === "0.0.0.0" || HOST === "::" ? "localhost" : HOST;
-  return `${protocol}://${displayHost}:${port}/`;
+
+  console.log(`Serving files from ${__dirname}`);
+  console.log(`Godot Web server is running at http://${displayHost}:${PORT}/`);
+});
+
+function isInternalPath(requestPath) {
+  return (
+    INTERNAL_PATHS.has(requestPath) ||
+    requestPath.startsWith("/node_modules/") ||
+    requestPath.startsWith("/.idea/")
+  );
 }
 
-function startServer(server, protocol, port) {
-  server.listen(port, HOST, () => {
-    console.log(`Godot Web server is running at ${getLocalUrl(protocol, port)}`);
-  });
-}
-
-function startHttps(port) {
-  if (!HTTPS_KEY || !HTTPS_CERT) {
-    throw new Error("HTTPS requires HTTPS_KEY and HTTPS_CERT.");
+function saveGameState(req, res) {
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+    res.status(400).json({ ok: false, error: "Expected a JSON object." });
+    return;
   }
 
-  const httpsOptions = {
-    key: fs.readFileSync(resolveLocalPath(HTTPS_KEY)),
-    cert: fs.readFileSync(resolveLocalPath(HTTPS_CERT)),
+  const payload = req.body;
+  if (!payload.game || typeof payload.game !== "object" || Array.isArray(payload.game)) {
+    res.status(400).json({ ok: false, error: "Missing game payload." });
+    return;
+  }
+
+  const database = normalizeDatabase(readDatabase());
+  const winner = getWinner(payload);
+  const gameId = getGameId(payload);
+
+  if (
+    payload.source === "victory" &&
+    winner &&
+    Object.prototype.hasOwnProperty.call(database.victory_counts, winner) &&
+    gameId &&
+    !database.counted_victory_game_ids.includes(gameId)
+  ) {
+    database.victory_counts[winner] += 1;
+    database.counted_victory_game_ids.push(gameId);
+    if (database.counted_victory_game_ids.length > 200) {
+      database.counted_victory_game_ids = database.counted_victory_game_ids.slice(-200);
+    }
+  }
+
+  database.game_payload = payload;
+  database.updated_at_unix_ms = Date.now();
+  writeDatabase(database);
+  console.log(
+    `[database] saved source=${String(payload.source || "")} game_id=${gameId || ""} turn=${String(payload.game.turn || "")} winner=${winner || ""}`,
+  );
+  res.json({ ok: true, database });
+}
+
+function readDatabase() {
+  try {
+    if (!fs.existsSync(DATABASE_PATH)) {
+      const database = createDefaultDatabase();
+      writeDatabase(database);
+      return database;
+    }
+
+    const parsed = JSON.parse(fs.readFileSync(DATABASE_PATH, "utf8"));
+    return normalizeDatabase(parsed);
+  } catch (error) {
+    console.error("Failed to read database:", error);
+    return createDefaultDatabase();
+  }
+}
+
+function writeDatabase(database) {
+  const normalized = normalizeDatabase(database);
+  const tmpPath = `${DATABASE_PATH}.tmp`;
+  fs.writeFileSync(tmpPath, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
+  try {
+    fs.renameSync(tmpPath, DATABASE_PATH);
+  } catch (error) {
+    if (error && (error.code === "EPERM" || error.code === "EEXIST")) {
+      fs.rmSync(DATABASE_PATH, { force: true });
+      fs.renameSync(tmpPath, DATABASE_PATH);
+      return;
+    }
+    throw error;
+  }
+}
+
+function createDefaultDatabase() {
+  return {
+    schema_version: 1,
+    victory_counts: {
+      blue: 0,
+      red: 0,
+    },
+    game_payload: null,
+    counted_victory_game_ids: [],
+    updated_at_unix_ms: null,
   };
-
-  startServer(https.createServer(httpsOptions, app), "https", port);
 }
 
-if (PROTOCOL === "http") {
-  startServer(http.createServer(app), "http", PORT);
-} else if (PROTOCOL === "https") {
-  startHttps(PORT);
-} else {
-  startServer(http.createServer(app), "http", HTTP_PORT);
-  startHttps(HTTPS_PORT);
+function normalizeDatabase(value) {
+  const defaults = createDefaultDatabase();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return defaults;
+  }
+
+  return {
+    schema_version: 1,
+    victory_counts: {
+      blue: sanitizeCount(value.victory_counts && value.victory_counts.blue),
+      red: sanitizeCount(value.victory_counts && value.victory_counts.red),
+    },
+    game_payload:
+      value.game_payload && typeof value.game_payload === "object" && !Array.isArray(value.game_payload)
+        ? value.game_payload
+        : null,
+    counted_victory_game_ids: Array.isArray(value.counted_victory_game_ids)
+      ? value.counted_victory_game_ids.map(String)
+      : [],
+    updated_at_unix_ms:
+      Number.isFinite(Number(value.updated_at_unix_ms)) ? Number(value.updated_at_unix_ms) : null,
+  };
 }
 
-console.log(`Serving files from ${WEB_ROOT}`);
+function sanitizeCount(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count < 0) {
+    return 0;
+  }
+  return Math.floor(count);
+}
+
+function getWinner(payload) {
+  if (!payload.game || typeof payload.game !== "object") {
+    return "";
+  }
+  const winner = String(payload.game.winner || "");
+  return winner === "blue" || winner === "red" ? winner : "";
+}
+
+function getGameId(payload) {
+  if (payload.game_id) {
+    return String(payload.game_id);
+  }
+  if (payload.game && payload.game.game_id) {
+    return String(payload.game.game_id);
+  }
+  return "";
+}
